@@ -1,164 +1,197 @@
-"""
-================================================================================
-PyLTSpice Workshop — 3 Core Use Cases
-================================================================================
-This script walks through three increasingly powerful ways to automate LTSpice
-simulations using Python. Each use case builds on the previous one.
-
-USE CASE 1 — Parameter Sweep
-    Run the same circuit with different R/C values and compare Bode plots.
-    Great for understanding how component values affect filter behavior.
-
-USE CASE 2 — AC Analysis & Custom Matplotlib Plotting
-    Extract raw simulation data and build publication-quality Bode plots.
-    Shows how to work with complex-valued frequency data from LTSpice.
-
-USE CASE 3 — Monte Carlo / Tolerance Analysis
-    Simulate component variation (e.g. ±5% resistor tolerance) across many
-    random samples to see how manufacturing spread affects your design.
-
-Requirements:
-    pip install PyLTSpice matplotlib numpy
-
-LTSpice must be installed. Update the config paths below before running.
-================================================================================
-"""
-
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-from PyLTSpice import LTspice, RawRead, SpiceEditor
 import os
 import shutil
+import subprocess
+import time
+import re
 
-# ── Config — update these paths for your machine ─────────────────────────────
+from PyLTSpice import RawRead
 
-LTSPICE_PATH   = r"C:\Program Files\ADI\LTspice\LTspice.exe"
+
+# ────────────────────────────────────────────────────────────────
+# USER CONFIGURATION (EDIT THESE FIRST)
+# ────────────────────────────────────────────────────────────────
+
+# Path to LTSpice executable (REQUIRED)
+LTSPICE_PATH = r"C:\Program Files\ADI\LTspice\LTspice.exe"
+
+# Path to your base schematic (.asc file)
 SCHEMATIC_PATH = r"C:\Users\lizab\OneDrive\Documents\LTspice\Draft16.asc"
-OUTPUT_FOLDER  = r"C:\Users\lizab\Downloads\rc_sweep_output"
 
-# ── Shared helper ─────────────────────────────────────────────────────────────
+# Folder where all generated files will be stored
+OUTPUT_FOLDER = r"C:\Users\lizab\Downloads\rc_sweep_output"
+
+# Name of the node you want to measure
+NODE_NAME = "out"
+
+# Toggle which use cases to run
+RUN_UC1 = True
+RUN_UC2 = True
+RUN_UC3 = True
+
+
+# ────────────────────────────────────────────────────────────────
+# HELPER FUNCTIONS
+# ────────────────────────────────────────────────────────────────
 
 def cutoff_hz(R, C):
-    """Calculate the theoretical -3dB cutoff frequency for an RC filter."""
+    """
+    Compute theoretical cutoff frequency for RC low-pass filter:
+        fc = 1 / (2πRC)
+    """
     return 1.0 / (2 * np.pi * R * C)
+
+
+def wait_for_file(path, timeout=10):
+    """
+    Wait until a file exists (used for LTSpice .raw output).
+
+    Why this is needed:
+    LTSpice runs as a separate process, so Python might try to read
+    the .raw file BEFORE it's finished writing.
+    """
+    start = time.time()
+    while not os.path.exists(path):
+        if time.time() - start > timeout:
+            raise TimeoutError(f"{path} not created")
+        time.sleep(0.1)
 
 
 def run_simulation(R, C, filename):
     """
-    Copy the base schematic, inject R and C parameter values,
-    run LTSpice headlessly, and return the path to the .raw output file.
+    Run a single LTSpice simulation with given R and C values.
 
-    PyLTSpice's SpiceEditor finds the .param line in the .asc file and
-    overwrites the value for the named parameter. This means your schematic
-    must already have .param R=... and .param C=... directives in it.
+    Steps:
+    1. Copy the base schematic (so we never modify the original)
+    2. Replace the .param R and C values directly in the file text
+    3. Run LTSpice in batch mode (no GUI)
+    4. Wait for .raw output file and return its path
     """
-    # Make a copy of the schematic so we never modify the original
     asc_path = os.path.join(OUTPUT_FOLDER, filename)
     shutil.copy(SCHEMATIC_PATH, asc_path)
 
-    # Open the copied schematic and update parameter values
-    se = SpiceEditor(asc_path)
-    se.set_parameter("R", R)   # overwrites .param R=<value>
-    se.set_parameter("C", C)   # overwrites .param C=<value>
-    se.save_netlist(asc_path)  # writes changes back to the .asc file
+    # Read the schematic as plain text
+    with open(asc_path, "r") as f:
+        content = f.read()
 
-    # Run LTSpice in batch mode (no GUI) on the modified schematic.
-    # LTSpice automatically creates a .raw file next to the .asc file.
-    LTspice.run(asc_path)
+    # Make sure .param line exists
+    param_lines = [l for l in content.splitlines() if 'param' in l.lower()]
+    if not param_lines:
+        raise ValueError("No .param line found in schematic. Add '.param R=1k C=10n' in LTSpice.")
 
-    # Return the path to the .raw file LTSpice generated
+    # Replace the .param values directly using regex
+    # Handles the LTSpice .asc format: TEXT x y Left 2 !.param R=... C=...
+    content = re.sub(
+        r'(\.param\s+R=)\S+(\s+C=)\S+',
+        lambda m: m.group(1) + str(R) + m.group(2) + str(C),
+        content,
+        flags=re.IGNORECASE
+    )
+
+    with open(asc_path, "w") as f:
+        f.write(content)
+
+    # Run LTSpice in batch mode (-b = no GUI)
+    
+    subprocess.run([LTSPICE_PATH, "-b", "-Run", asc_path], check=True, timeout=30)
+
+    # Wait for .raw file to be written
     raw_path = asc_path.replace(".asc", ".raw")
+    wait_for_file(raw_path)
+
     return raw_path
 
 
 def read_ac_results(raw_path):
     """
-    Read an LTSpice .raw file and return frequency, magnitude (dB), and phase.
+    Read frequency, magnitude, and phase from LTSpice .raw file.
 
-    LTSpice AC analysis stores voltages as complex numbers — magnitude gives
-    you the gain and angle gives you the phase shift at each frequency point.
+    LTSpice AC analysis outputs COMPLEX numbers:
+        V(f) = magnitude * e^(j*phase)
+
+    We convert:
+        magnitude → dB
+        phase → degrees
     """
     ltr = RawRead(raw_path)
+    traces = ltr.get_trace_names()
+    target = f"V({NODE_NAME})"
 
-    # get_trace() returns a trace object; get_wave(0) returns the data array
-    # .real strips the tiny imaginary component from the frequency axis
+    # Safety check: make sure node exists
+    if target not in traces:
+        raise ValueError(f"{target} not found. Available traces: {traces}")
+
+    # Frequency axis (real values only)
     freq = np.array(ltr.get_trace("frequency").get_wave(0)).real
-    vout = np.array(ltr.get_trace("V(out)").get_wave(0))
 
-    # Convert complex voltage to magnitude in dB and phase in degrees
-    mag_db = 20 * np.log10(np.abs(vout))       # |V| → dB
-    phase  = np.angle(vout, deg=True)           # complex angle → degrees
+    # Complex output voltage
+    vout = np.array(ltr.get_trace(target).get_wave(0))
+
+    # Convert to magnitude (dB) and phase (degrees)
+    mag_db = 20 * np.log10(np.abs(vout))
+    phase = np.angle(vout, deg=True)
 
     return freq, mag_db, phase
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# USE CASE 1 — Parameter Sweep
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# Goal: run the same schematic multiple times with different R and C values,
-# then overlay all the Bode plots so you can directly compare them.
-#
-# This is useful for:
-#   - Finding which component values hit a target cutoff frequency
-#   - Visualizing the tradeoff between R and C for the same fc
-#   - Quickly generating design curves without touching the schematic
+def find_fc(freq, mag_db):
+    """
+    Estimate cutoff frequency from simulation data.
+    Finds the frequency where magnitude is closest to -3 dB.
+    """
+    idx = np.argmin(np.abs(mag_db + 3))
+    return freq[idx]
 
-def use_case_1_parameter_sweep():
+
+def save_csv(freq, mag, phase, filename):
+    """
+    Save simulation data to CSV for external tools (Excel, MATLAB, etc.)
+    """
+    np.savetxt(
+        filename,
+        np.column_stack([freq, mag, phase]),
+        delimiter=",",
+        header="freq,mag_db,phase",
+        comments=""
+    )
+
+
+# ────────────────────────────────────────────────────────────────
+# USE CASE 1 — PARAMETER SWEEP
+# ────────────────────────────────────────────────────────────────
+
+def use_case_1():
     print("\n=== USE CASE 1: Parameter Sweep ===")
+
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-    # Define the values you want to sweep.
-    # np.meshgrid / list comprehension creates every R+C combination.
-    R_VALUES = [15e3, 6.8e3, 4.7e3]    # ohms
-    C_VALUES = [6.8e-9, 15e-9, 22e-9]  # farads
+    # Define values to sweep
+    R_VALUES = [15e3, 6.8e3, 4.7e3]
+    C_VALUES = [6.8e-9, 15e-9, 22e-9]
 
-    # Build all (R, C) pairs — this gives 3×3 = 9 combinations
-    combinations = [(R, C) for R in R_VALUES for C in C_VALUES]
-    n = len(combinations)
+    # Generate all R+C combinations
+    combos = [(R, C) for R in R_VALUES for C in C_VALUES]
 
-    # Assign a unique color to each combination for the plot
-    colors = cm.tab10(np.linspace(0, 1, n))
-
-    # Set up a figure with two stacked subplots sharing the same x-axis
     fig, (ax_mag, ax_phase) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
     ax_mag.set_title("USE CASE 1 — Parameter Sweep: RC Low-Pass Filter", fontsize=13)
 
-    for idx, (R, C) in enumerate(combinations):
-        print(f"  Simulating R={R/1e3:.1f}kΩ, C={C*1e9:.0f}nF ...")
+    for i, (R, C) in enumerate(combos):
+        print(f"  Simulating R={R/1e3:.1f}kΩ, C={C*1e9:.1f}nF ...")
+        raw = run_simulation(R, C, f"sweep_{i}.asc")
+        freq, mag, phase = read_ac_results(raw)
+        fc_meas = find_fc(freq, mag)
 
-        # Run the simulation and get the .raw file path
-        raw_path = run_simulation(R, C, filename=f"sweep_{idx}.asc")
+        label = f"R={R/1e3:.1f}kΩ, C={C*1e9:.0f}nF  (fc={fc_meas:.0f} Hz)"
+        ax_mag.semilogx(freq, mag, label=label)
+        ax_phase.semilogx(freq, phase)
 
-        if not os.path.exists(raw_path):
-            print(f"  [!] Simulation failed — skipping")
-            continue
-
-        # Read frequency, magnitude, and phase from the .raw file
-        freq, mag_db, phase = read_ac_results(raw_path)
-
-        # Calculate the theoretical cutoff to annotate the plot
-        fc = cutoff_hz(R, C)
-        label = f"R={R/1e3:.1f}kΩ, C={C*1e9:.0f}nF  (fc={fc:.0f} Hz)"
-
-        # Plot magnitude and phase curves
-        ax_mag.semilogx(freq, mag_db, color=colors[idx], linewidth=1.8, label=label)
-        ax_phase.semilogx(freq, phase, color=colors[idx], linewidth=1.8, label=label)
-
-        # Add a dashed vertical line at the theoretical -3dB frequency
-        ax_mag.axvline(fc, color=colors[idx], linestyle="--", linewidth=0.8, alpha=0.5)
-
-    # Add a horizontal reference line at -3 dB
     ax_mag.axhline(-3, color="gray", linestyle=":", linewidth=1, label="-3 dB")
-
-    # Format magnitude plot
     ax_mag.set_ylabel("Magnitude (dB)")
     ax_mag.set_ylim(-50, 5)
     ax_mag.grid(True, which="both", alpha=0.3)
-    ax_mag.legend(fontsize=7, loc="lower left", ncol=2)
+    ax_mag.legend(fontsize=7, loc="lower left")
 
-    # Format phase plot
     ax_phase.set_ylabel("Phase (°)")
     ax_phase.set_xlabel("Frequency (Hz)")
     ax_phase.set_ylim(-100, 10)
@@ -167,247 +200,165 @@ def use_case_1_parameter_sweep():
     plt.tight_layout()
     plt.savefig(os.path.join(OUTPUT_FOLDER, "uc1_sweep.png"), dpi=150)
     plt.show()
-    print("  Done. Plot saved to uc1_sweep.png")
+
+    print("  Done.")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# USE CASE 2 — AC Analysis & Custom Matplotlib Plotting
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# Goal: run a single simulation and build a polished, annotated Bode plot
-# that goes beyond what LTSpice's waveform viewer can produce.
-#
-# This is useful for:
-#   - Lab reports and presentations
-#   - Annotating key points (fc, -3dB, -20dB/dec slope)
-#   - Overlaying a theoretical curve against simulated data
+# ────────────────────────────────────────────────────────────────
+# USE CASE 2 — SINGLE AC ANALYSIS
+# ────────────────────────────────────────────────────────────────
 
-def use_case_2_ac_analysis():
-    print("\n=== USE CASE 2: AC Analysis & Custom Plotting ===")
-    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+def use_case_2():
+    print("\n=== USE CASE 2: AC Analysis ===")
 
-    # Use the best values from our earlier search — hits 1556 Hz within 0.28%
-    R = 15e3    # 15 kΩ
-    C = 6.8e-9  # 6.8 nF
-    fc = cutoff_hz(R, C)
-    print(f"  Simulating R={R/1e3:.0f}kΩ, C={C*1e9:.1f}nF → fc={fc:.1f} Hz")
+    R, C = 15e3, 6.8e-9
+    fc_theory = cutoff_hz(R, C)
+    print(f"  Simulating R={R/1e3:.0f}kΩ, C={C*1e9:.1f}nF → fc={fc_theory:.1f} Hz")
 
-    raw_path = run_simulation(R, C, filename="uc2_ac.asc")
+    raw = run_simulation(R, C, "uc2.asc")
+    freq, mag, phase = read_ac_results(raw)
+    fc = find_fc(freq, mag)
 
-    if not os.path.exists(raw_path):
-        print("  [!] Simulation failed.")
-        return
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    fig.suptitle(f"USE CASE 2 — AC Analysis  |  R={R/1e3:.0f}kΩ, C={C*1e9:.1f}nF  |  fc={fc:.0f} Hz", fontsize=12)
 
-    freq, mag_db, phase = read_ac_results(raw_path)
-
-    # ── Build a polished annotated Bode plot ─────────────────────────────────
-
-    fig, (ax_mag, ax_phase) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
-    fig.suptitle(f"USE CASE 2 — AC Analysis  |  R={R/1e3:.0f}kΩ, C={C*1e9:.1f}nF  |  fc={fc:.0f} Hz",
-                 fontsize=12)
-
-    # ── Magnitude plot ────────────────────────────────────────────────────────
-
-    ax_mag.semilogx(freq, mag_db, color="steelblue", linewidth=2, label="Simulated")
-
-    # Overlay the ideal theoretical response: H(f) = 1 / sqrt(1 + (f/fc)^2)
+    # Overlay theoretical response
     f_theory = np.logspace(1, 6, 500)
-    mag_theory = -10 * np.log10(1 + (f_theory / fc)**2)  # in dB
-    ax_mag.semilogx(f_theory, mag_theory, color="orange", linewidth=1.5,
-                    linestyle="--", label="Theoretical")
+    mag_theory = -10 * np.log10(1 + (f_theory / fc_theory)**2)
+    phase_theory = -np.degrees(np.arctan(f_theory / fc_theory))
 
-    # Mark the -3 dB point with a dot and annotation
-    ax_mag.axhline(-3, color="gray", linestyle=":", linewidth=1)
-    ax_mag.axvline(fc, color="red", linestyle="--", linewidth=1, alpha=0.7)
-    ax_mag.annotate(f"fc = {fc:.0f} Hz\n-3 dB",
-                    xy=(fc, -3), xytext=(fc * 3, -10),
-                    arrowprops=dict(arrowstyle="->", color="red"),
-                    color="red", fontsize=9)
+    ax1.semilogx(freq, mag, color="steelblue", linewidth=2, label="Simulated")
+    ax1.semilogx(f_theory, mag_theory, color="orange", linewidth=1.5, linestyle="--", label="Theoretical")
+    ax1.axvline(fc, color="red", linestyle="--", linewidth=1, alpha=0.7)
+    ax1.axhline(-3, color="gray", linestyle=":", linewidth=1)
+    ax1.annotate(f"fc = {fc:.0f} Hz\n-3 dB", xy=(fc, -3), xytext=(fc * 3, -10),
+                 arrowprops=dict(arrowstyle="->", color="red"), color="red", fontsize=9)
 
-    # Annotate the -20 dB/decade rolloff slope in the stopband
-    ax_mag.annotate("-20 dB/decade", xy=(fc * 10, -23), fontsize=9,
-                    color="steelblue", style="italic")
+    ax2.semilogx(freq, phase, color="steelblue", linewidth=2, label="Simulated")
+    ax2.semilogx(f_theory, phase_theory, color="orange", linewidth=1.5, linestyle="--", label="Theoretical")
+    ax2.axhline(-45, color="gray", linestyle=":", linewidth=1)
+    ax2.axvline(fc, color="red", linestyle="--", linewidth=1, alpha=0.7)
 
-    ax_mag.set_ylabel("Magnitude (dB)")
-    ax_mag.set_ylim(-60, 5)
-    ax_mag.grid(True, which="both", alpha=0.3)
-    ax_mag.legend(fontsize=9)
+    ax1.set_ylabel("Magnitude (dB)")
+    ax1.set_ylim(-60, 5)
+    ax1.grid(True, which="both", alpha=0.3)
+    ax1.legend(fontsize=9)
 
-    # ── Phase plot ────────────────────────────────────────────────────────────
-
-    ax_phase.semilogx(freq, phase, color="steelblue", linewidth=2, label="Simulated")
-
-    # Theoretical phase: φ(f) = -arctan(f/fc)
-    phase_theory = -np.degrees(np.arctan(f_theory / fc))
-    ax_phase.semilogx(f_theory, phase_theory, color="orange", linewidth=1.5,
-                      linestyle="--", label="Theoretical")
-
-    # Mark -45° at fc — a key sanity check for any RC filter
-    ax_phase.axhline(-45, color="gray", linestyle=":", linewidth=1)
-    ax_phase.axvline(fc, color="red", linestyle="--", linewidth=1, alpha=0.7)
-    ax_phase.annotate("-45° at fc", xy=(fc, -45), xytext=(fc * 3, -35),
-                      arrowprops=dict(arrowstyle="->", color="red"),
-                      color="red", fontsize=9)
-
-    ax_phase.set_ylabel("Phase (°)")
-    ax_phase.set_xlabel("Frequency (Hz)")
-    ax_phase.set_ylim(-100, 10)
-    ax_phase.grid(True, which="both", alpha=0.3)
-    ax_phase.legend(fontsize=9)
+    ax2.set_ylabel("Phase (°)")
+    ax2.set_xlabel("Frequency (Hz)")
+    ax2.set_ylim(-100, 10)
+    ax2.grid(True, which="both", alpha=0.3)
+    ax2.legend(fontsize=9)
 
     plt.tight_layout()
     plt.savefig(os.path.join(OUTPUT_FOLDER, "uc2_ac_analysis.png"), dpi=150)
+
+    # Save data to CSV for external analysis
+    save_csv(freq, mag, phase, os.path.join(OUTPUT_FOLDER, "uc2.csv"))
+
     plt.show()
-    print("  Done. Plot saved to uc2_ac_analysis.png")
+    print("  Done.")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# USE CASE 3 — Monte Carlo / Tolerance Analysis
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# Goal: simulate what happens when your components have real-world tolerances.
-# Real resistors and capacitors are not exactly their labeled value — a "10kΩ"
-# resistor with ±5% tolerance could actually be anywhere from 9.5kΩ to 10.5kΩ.
-#
-# We randomly sample R and C within their tolerance bands and run a simulation
-# for each sample. The spread of the resulting Bode plots shows you how much
-# your circuit's behavior varies due to manufacturing tolerances.
-#
-# This is useful for:
-#   - Deciding whether ±5% or ±1% components are needed for your spec
-#   - Understanding worst-case cutoff frequency drift
-#   - Justifying component choices in a design review
+# ────────────────────────────────────────────────────────────────
+# USE CASE 3 — MONTE CARLO ANALYSIS
+# ────────────────────────────────────────────────────────────────
 
-def use_case_3_monte_carlo():
-    print("\n=== USE CASE 3: Monte Carlo Tolerance Analysis ===")
-    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+def use_case_3():
+    print("\n=== USE CASE 3: Monte Carlo ===")
 
-    # Nominal design values
-    R_nom = 15e3    # 15 kΩ nominal
-    C_nom = 6.8e-9  # 6.8 nF nominal
+    R_nom, C_nom = 15e3, 6.8e-9
+    tol = 0.05
+    N = 30
 
-    # Tolerance as a fraction (0.05 = ±5%)
-    R_tolerance = 0.05
-    C_tolerance = 0.05
-
-    # Number of random samples to simulate.
-    # More samples = smoother distribution but longer runtime.
-    N_SAMPLES = 30
-
-    # Seed the random number generator for reproducibility
     np.random.seed(42)
 
-    # Generate N random R and C values uniformly distributed within tolerance
-    # np.random.uniform(low, high, N) draws N samples between low and high
-    R_samples = np.random.uniform(R_nom * (1 - R_tolerance),
-                                  R_nom * (1 + R_tolerance),
-                                  N_SAMPLES)
-    C_samples = np.random.uniform(C_nom * (1 - C_tolerance),
-                                  C_nom * (1 + C_tolerance),
-                                  N_SAMPLES)
+    # Generate random R and C values within tolerance band
+    Rs = np.random.uniform(R_nom * (1 - tol), R_nom * (1 + tol), N)
+    Cs = np.random.uniform(C_nom * (1 - tol), C_nom * (1 + tol), N)
 
-    fig, (ax_mag, ax_phase) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
-    fig.suptitle(f"USE CASE 3 — Monte Carlo  |  R={R_nom/1e3:.0f}kΩ ±{R_tolerance*100:.0f}%,"
-                 f"  C={C_nom*1e9:.1f}nF ±{C_tolerance*100:.0f}%"
-                 f"  ({N_SAMPLES} samples)", fontsize=11)
-
-    # Store all cutoff frequencies so we can plot a histogram
+    all_mag = []
     fc_list = []
 
-    for i, (R, C) in enumerate(zip(R_samples, C_samples)):
-        print(f"  Sample {i+1}/{N_SAMPLES}: R={R/1e3:.2f}kΩ, C={C*1e9:.2f}nF")
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    fig.suptitle(f"USE CASE 3 — Monte Carlo  |  R={R_nom/1e3:.0f}kΩ ±{tol*100:.0f}%,"
+                 f"  C={C_nom*1e9:.1f}nF ±{tol*100:.0f}%  ({N} samples)", fontsize=11)
 
-        raw_path = run_simulation(R, C, filename=f"mc_{i}.asc")
+    for i, (R, C) in enumerate(zip(Rs, Cs)):
+        print(f"  Sample {i+1}/{N}: R={R/1e3:.2f}kΩ, C={C*1e9:.2f}nF")
+        raw = run_simulation(R, C, f"mc_{i}.asc")
+        freq, mag, phase = read_ac_results(raw)
 
-        if not os.path.exists(raw_path):
-            print(f"  [!] Simulation failed — skipping")
-            continue
+        all_mag.append(mag)
+        fc_list.append(find_fc(freq, mag))
 
-        freq, mag_db, phase = read_ac_results(raw_path)
-        fc = cutoff_hz(R, C)
-        fc_list.append(fc)
+        # Faint line for each sample
+        ax1.semilogx(freq, mag, color="steelblue", alpha=0.3, linewidth=0.8)
+        ax2.semilogx(freq, phase, color="steelblue", alpha=0.3, linewidth=0.8)
 
-        # Plot each sample as a thin semi-transparent line so overlaps are visible
-        ax_mag.semilogx(freq, mag_db, color="steelblue", linewidth=0.8, alpha=0.3)
-        ax_phase.semilogx(freq, phase, color="steelblue", linewidth=0.8, alpha=0.3)
+    # Overlay nominal response in bold red
+    raw_nom = run_simulation(R_nom, C_nom, "mc_nominal.asc")
+    freq_n, mag_n, phase_n = read_ac_results(raw_nom)
+    fc_nom = find_fc(freq_n, mag_n)
+    ax1.semilogx(freq_n, mag_n, color="red", linewidth=2.5, label=f"Nominal (fc={fc_nom:.0f} Hz)", zorder=5)
+    ax2.semilogx(freq_n, phase_n, color="red", linewidth=2.5, label="Nominal", zorder=5)
 
-    # Overlay the nominal (ideal) response in a bold contrasting color
-    raw_nom = run_simulation(R_nom, C_nom, filename="mc_nominal.asc")
-    if os.path.exists(raw_nom):
-        freq_n, mag_n, phase_n = read_ac_results(raw_nom)
-        fc_nom = cutoff_hz(R_nom, C_nom)
-        ax_mag.semilogx(freq_n, mag_n, color="red", linewidth=2.5,
-                        label=f"Nominal (fc={fc_nom:.0f} Hz)", zorder=5)
-        ax_phase.semilogx(freq_n, phase_n, color="red", linewidth=2.5,
-                          label="Nominal", zorder=5)
+    # Convert list to array for envelope
+    all_mag = np.array(all_mag)
+    ax1.fill_between(freq, all_mag.min(0), all_mag.max(0), alpha=0.15, color="steelblue", label="Min/Max envelope")
 
-    # ── Annotate with statistics ──────────────────────────────────────────────
-
+    # Stats box
     fc_arr = np.array(fc_list)
-    fc_mean = np.mean(fc_arr)
-    fc_std  = np.std(fc_arr)
-    fc_min  = np.min(fc_arr)
-    fc_max  = np.max(fc_arr)
+    stats = (f"fc stats ({N} samples)\n"
+             f"Mean:  {np.mean(fc_arr):.0f} Hz\n"
+             f"Std:   {np.std(fc_arr):.0f} Hz\n"
+             f"Min:   {np.min(fc_arr):.0f} Hz\n"
+             f"Max:   {np.max(fc_arr):.0f} Hz")
+    ax1.text(0.98, 0.95, stats, transform=ax1.transAxes, fontsize=8,
+             verticalalignment="top", horizontalalignment="right",
+             bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8))
 
-    stats_text = (f"fc stats ({N_SAMPLES} samples)\n"
-                  f"Mean:  {fc_mean:.0f} Hz\n"
-                  f"Std:   {fc_std:.0f} Hz\n"
-                  f"Min:   {fc_min:.0f} Hz\n"
-                  f"Max:   {fc_max:.0f} Hz")
+    ax1.axhline(-3, color="gray", linestyle=":", linewidth=1)
+    ax1.set_ylabel("Magnitude (dB)")
+    ax1.set_ylim(-50, 5)
+    ax1.grid(True, which="both", alpha=0.3)
+    ax1.legend(fontsize=8)
 
-    # Place the stats box in the upper right of the magnitude plot
-    ax_mag.text(0.98, 0.95, stats_text, transform=ax_mag.transAxes,
-                fontsize=8, verticalalignment="top", horizontalalignment="right",
-                bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8))
-
-    # Add a dummy line for the legend label for the Monte Carlo samples
-    from matplotlib.lines import Line2D
-    mc_line = Line2D([0], [0], color="steelblue", linewidth=1.5, alpha=0.5,
-                     label=f"Monte Carlo samples (n={N_SAMPLES})")
-
-    # Format magnitude plot
-    ax_mag.axhline(-3, color="gray", linestyle=":", linewidth=1)
-    ax_mag.set_ylabel("Magnitude (dB)")
-    ax_mag.set_ylim(-50, 5)
-    ax_mag.grid(True, which="both", alpha=0.3)
-    ax_mag.legend(handles=[mc_line] + ax_mag.get_lines()[-1:], fontsize=8)
-
-    # Format phase plot
-    ax_phase.set_ylabel("Phase (°)")
-    ax_phase.set_xlabel("Frequency (Hz)")
-    ax_phase.set_ylim(-100, 10)
-    ax_phase.grid(True, which="both", alpha=0.3)
+    ax2.set_ylabel("Phase (°)")
+    ax2.set_xlabel("Frequency (Hz)")
+    ax2.set_ylim(-100, 10)
+    ax2.grid(True, which="both", alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(os.path.join(OUTPUT_FOLDER, "uc3_monte_carlo.png"), dpi=150)
     plt.show()
 
-    # ── Bonus: histogram of cutoff frequency spread ───────────────────────────
-    # This gives an intuitive view of how much fc varies across samples
-
+    # Bonus histogram of fc distribution
     fig2, ax_hist = plt.subplots(figsize=(7, 4))
     ax_hist.hist(fc_arr, bins=10, color="steelblue", edgecolor="white", alpha=0.85)
-    ax_hist.axvline(fc_mean, color="red", linestyle="--", linewidth=1.5,
-                    label=f"Mean = {fc_mean:.0f} Hz")
-    ax_hist.axvline(fc_nom, color="orange", linestyle="--", linewidth=1.5,
-                    label=f"Nominal = {fc_nom:.0f} Hz")
+    ax_hist.axvline(np.mean(fc_arr), color="red", linestyle="--", linewidth=1.5, label=f"Mean = {np.mean(fc_arr):.0f} Hz")
+    ax_hist.axvline(fc_nom, color="orange", linestyle="--", linewidth=1.5, label=f"Nominal = {fc_nom:.0f} Hz")
     ax_hist.set_xlabel("Cutoff Frequency (Hz)")
     ax_hist.set_ylabel("Count")
-    ax_hist.set_title(f"fc Distribution — ±{R_tolerance*100:.0f}% Tolerance ({N_SAMPLES} samples)")
+    ax_hist.set_title(f"fc Distribution — ±{tol*100:.0f}% Tolerance ({N} samples)")
     ax_hist.legend(fontsize=9)
     plt.tight_layout()
     plt.savefig(os.path.join(OUTPUT_FOLDER, "uc3_histogram.png"), dpi=150)
     plt.show()
 
-    print(f"  Done. fc mean={fc_mean:.0f} Hz, std={fc_std:.0f} Hz")
-    print("  Plots saved to uc3_monte_carlo.png and uc3_histogram.png")
+    print(f"  Done. fc mean={np.mean(fc_arr):.0f} Hz, std={np.std(fc_arr):.0f} Hz")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Entry point — run all three use cases in order
-# ══════════════════════════════════════════════════════════════════════════════
+# ────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    use_case_1_parameter_sweep()
-    use_case_2_ac_analysis()
-    use_case_3_monte_carlo()
+    if RUN_UC1:
+        use_case_1()
+
+    if RUN_UC2:
+        use_case_2()
+
+    if RUN_UC3:
+        use_case_3()
