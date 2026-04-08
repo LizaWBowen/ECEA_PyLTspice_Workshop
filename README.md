@@ -41,6 +41,9 @@ pip install PyLTSpice matplotlib numpy
 - Basic circuit theory — RC filters, Bode plots, cutoff frequency
 - Familiarity with LTSpice GUI (drawing schematics, running .ac simulations)
 
+If you want to learn more about pyltspice, this is their documentation
+-  https://pyltspice.readthedocs.io/en/latest/
+
 ---
 
 ## Setup
